@@ -1,0 +1,243 @@
+library(jsonlite)
+library(dplyr)
+library(stringr)
+
+src_dir = "./data"
+# src_dir = "C:/Users/ppark/Repositories/groves_template"
+ui_json = read_json(sprintf('%s/ui.json', src_dir))
+ui_name_list = lapply(ui_json, function(x) { x$name } )
+names(ui_json) = ui_name_list
+ui_public_list = c("delay", "offset", "rate", "limit", "available generated", "available day to day")
+ui_private_list = c("delay", "offset", "rate", "limit", "available_G", "available_D")
+ui_private_list = mapply(function(x,y) {x = y}, ui_public_list, ui_private_list)
+
+group_json = read_json(sprintf('%s/group.json', src_dir))
+stream_json = read_json(sprintf('%s/stream.json', src_dir))
+for (x in names(stream_json)) {
+  downstream = stream_json[[x]]$downstream
+  if (!is.null(downstream)) { stream_json[[x]]$downstream = unlist(downstream) }
+  upstream = stream_json[[x]]$upstream
+  if (!is.null(upstream)) { stream_json[[x]]$upstream = unlist(upstream) }
+  f = stream_json[[x]]$transformation
+  if (!is.null(f)) { stream_json[[x]]$transformation = unlist(f) }
+}
+
+stream_delay = read.csv(sprintf("%s/stream_delay.csv", src_dir), check.names = FALSE, header = FALSE, col.names = c("k","v"))
+stream_param = read.csv(sprintf("%s/stream_param.csv", src_dir), check.names = FALSE)
+stream_baseline = read.csv(sprintf("%s/stream_baseline.csv", src_dir), check.names = FALSE)
+
+transformation_list = c("baseline", ui_name_list)
+
+year_min = 2020
+year_max = 2045
+year_list = c(year_min:year_max)
+year_n = length(year_list)
+
+icbm_platform_levels = c("GBSD","Minuteman")
+icbm_warhead_levels = c("W87-1","W87-0","FSLW","W78")
+
+
+delay <- function(v, param) {
+  if(param > 0){
+    v_tmp = v[1]
+    v = lag(v, n = param)
+    
+  } else {
+    v_tmp = v[year_n]
+    v = lead(v, n = -param)
+  }
+  v = ifelse(is.na(v), v_tmp, v)
+  v
+}
+
+offset <- function(v, param) {
+  pmax(0, v + param)
+}
+
+rate <- function(v, param) {
+  v_delta = c(0,diff(v, 1))
+  v_delta = v_delta + param
+  for (i in c(1:year_n)) {
+    if (i == 1) {
+      v[i] = max(0, v[i] + v_delta[i])
+    } else {
+      v[i] = max(0, v[i-1] + v_delta[i])
+    }
+    
+    if (v[i] == 0 && i < year_n) {
+      v_delta[i+1] = max(0, v_delta[i+1])
+    }
+  }
+  v
+}
+
+limit <- function(v, param, param_list=NULL) {
+  
+  if (is.null(param_list)) {
+    pmin(v, param)
+    
+  }
+  
+  else {
+    lim_value = list()
+    
+    for (i in seq_along(v)) {
+
+      value = v[[i]]
+      param2 = param_list[[i]]
+      param = param
+      
+      lim_value[i] = list(pmin(value, param, param2))
+
+      param = param - lim_value[[i]]
+ 
+
+    }
+    lim_value
+  }
+    
+}
+
+available <- function(v, param) {
+  v * param
+}
+
+available_G <- function(v, param) {
+  v * param
+}
+
+available_D <- function(v, param) {
+  v * param
+}
+
+updateCrossPlatform <- function(x) {
+  f = stream_json[[x]]$transformation
+  upstream = stream_json[[x]]$upstream
+  
+  value_list = list()
+  param_list = list()
+  
+  for(i in seq_along(upstream)){
+    y = upstream[[i]]
+    value_list[i] = list(stream_json[[y]]$value)
+    param_list[i] = list(stream_json[[stream_json[[y]]$downstream]]$param)
+    
+  }
+  param = stream_json[[x]]$param
+  value = do.call(f, list(value_list, param, param_list))
+  
+  for(j in seq_along(value)) {
+    
+    z = value[[j]]
+    y = upstream[[j]]
+    
+    stream_json[[stream_json[[y]]$downstream]]$value <<- z
+    
+  }
+}
+
+
+
+
+for (x in names(stream_json)) { 
+  # program[[x]] = stream_json[[x]] # includes upstream, downstream, and transformation
+  if (is.na(str_match(x, "\\."))) {
+    stream_json[[x]]$value = stream_baseline[[x]]
+  } else {
+    if (str_ends(x, "delay")) {
+      param = stream_delay[stream_delay$k == x,]$v
+    } else {
+      param = stream_param[[x]]
+    }
+    
+    f = stream_json[[x]]$transformation
+    upstream = stream_json[[x]]$upstream
+    
+    if(length(upstream) > 1){
+      x0 = lapply(upstream, function(x) stream_json[[x]]$value)
+      param_list = list(rep(9999, length(x0[[1]])), rep(9999, length(x0[[1]])))
+      do.call(f, list(x0, param, param_list))
+      
+      
+    }else{
+      x0 = stream_json[[upstream]]$value
+      stream_json[[x]]$value = do.call(f, list(x0, param))
+    }
+    
+    stream_json[[x]]$param = param
+  }
+}
+
+sapply(c('ICBM.limit', "SSBN.available_D.limit", "SSBN.available_G.limit"), updateCrossPlatform)
+ICBM_downstream = c("Minuteman.delay.offset.rate.limit.available_D", "GBSD.delay.offset.rate.limit.available_D", "Minuteman.delay.offset.rate.limit.available_G", "GBSD.delay.offset.rate.limit.available_G")
+
+for(x in ICBM_downstream){
+  
+  f = stream_json[[x]]$transformation
+  upstream = stream_json[[x]]$upstream
+  param = stream_json[[x]]$param
+  
+  x0 = stream_json[[upstream]]$value
+  stream_json[[x]]$value = do.call(f, list(x0, param))
+  
+}
+
+
+
+# needed for plotting loadout, but should not rely on this
+wd = "./data/"
+entities_df <- read.csv(paste0(wd, "sample_entities.csv"))
+
+# parameters necessary for end users
+super_list = c("stream", "spreadsheet", "group", "loadout_input")
+group_view = list("ICBM" = "ICBM.platform", "ICBM Warhead" = "ICBM.warhead", 
+                  "SSBN" = "SSBN.platform", "SLBM" = "SSBN.weapon", "SLBM Warhead" = "SSBN.warhead", 
+                  "Bomber" = "Bomber.platform", "Cruise Missile" = "Bomber.weapon", 
+                  "Cruise Missile Warhead" = "Bomber.warhead", "Gravity Bomb" = "Bomber.bomb")
+
+req_df <- read.csv(paste0(wd, "sample_req.csv"))
+row_to_nested_list <- function(x, nested_list = NULL) {
+  if (is.null(nested_list)) {
+    nested_list = list()
+  }
+  
+  n = ncol(x)
+  X = as.vector(x[[1]])
+  if (n > 1) {
+    if (is.null(nested_list[[X]])) {
+      nested_list[[X]] = list()
+    }
+    nested_list[[X]] = row_to_nested_list(x[2:n], nested_list[[X]])
+  } else {
+    nested_list = X
+  }
+  nested_list
+}
+df_to_nested_list <- function(x) {
+  nested_list = list()
+  n = ncol(x)
+  for (i in c(1:nrow(x))) {
+    X = as.vector(x[i,1])
+    if (is.null(nested_list[[X]])) {
+      nested_list[[X]] = list()
+    }
+    nested_list[[X]] = row_to_nested_list(x[i,2:n], nested_list[[X]])
+  }
+  nested_list
+}
+req_value = df_to_nested_list(req_df)
+
+leg_list = c("Triad", "ICBM", "SSBN", "Bomber") # should be consistent with what is in "sample_req.csv"
+req_list = c("OGC", "OPLAN", "Option C") # should be consistent with what is in "sample_req.csv"
+
+tab_json = read_json(sprintf('%s/tab.json', src_dir))
+panel_width_viz = 9
+hidebar = FALSE
+
+# panel_width_viz = 10
+panel_width_dial = 12 - panel_width_viz
+plot_height = "65vh"
+
+# Comment/uncomment the below lines to control which header and footer appear in the app
+class = "UNCLASSIFIED"
+#class = "S//NF//RD, FRD"

@@ -1,0 +1,2140 @@
+library(shiny)
+library(stringr)
+library(DT)
+library(jsonlite)
+library(tidyr)
+library(plotly)
+library(shinyjs)
+library(zip)
+
+baseline_request_df_tree = list(icbm_request_df_tree, ssbn_request_df_tree, bomber_request_df_tree)
+names(baseline_request_df_tree) = c("ICBM","SSBN","Bomber")
+
+function(input, output, session) {
+  # Not currently used (was initially written for another purpose), but can be a useful utility function
+  getDownstreamAll <- function(x, stream_list = NULL) {
+    stream_list = c(stream_list, x)
+    downstream = stream[[x]]$downstream
+    
+    if (!is.null(downstream)) {
+      for (x in downstream) {
+        stream_list = getDownstreamAll(x, stream_list)
+      }
+    }
+    
+    stream_list
+  }
+  
+  observeEvent(input$showpanel, {
+    shinyjs::toggle(id = "Sidebar")
+    panel_width_viz = 12
+  })
+  
+  # observeEvent(input$showpanel,{
+  #   session$sendCustomMessage(type = 'resize', message = 1)
+  #   
+  # })
+  # output$plot <- renderPlot({
+  #   plot(1:10, main = "The width of this plot adjusts\nto window resizes but not to\nshow/hide sidepanel!")
+  # })
+  
+  #### Initialization Operations ####
+  stream <- reactiveValues()
+  transformation <- reactiveValues()
+  
+  initialize_stream <- function() {
+    for (x in names(stream_json)) {
+      # an assignment to a reactive variable can only seem to happen once
+      stream[[x]] = stream_json[[x]] # stream_json can serve as the baseline
+    }
+    
+    for (f in transformation_list) {
+      if (f != "baseline") {
+        # print(sprintf("initializing upstream_choices for %s",f))
+        tmp_list = list()
+        # filter out streams that include f as a transformation
+        upstream_candidates = sort(names(stream_json)[!grepl(pattern = f, x = names(stream_json))])
+        # filter out streams that serve as an upstream for f
+        # print(f)
+        upstream_candidates = sapply(upstream_candidates, function(x) {
+          is_not_upstream = TRUE
+          downstream = stream_json[[x]]$downstream
+          for (y in downstream) {
+            if (!is.na(str_match(string = y, pattern = f))) { is_not_upstream = FALSE }
+          }
+          if (is_not_upstream) {
+            x
+          }
+        })
+        tmp_list$upstream_choices = upstream_candidates
+        transformation[[f]] = tmp_list
+      }
+    }
+  }
+  
+  #### Process Execution ####
+  # observeEvent(c(input$restore_defaults, input$history), ignoreNULL = FALSE,  { # this seems to run after import history
+  observeEvent(input$restore_defaults, ignoreNULL = FALSE,  {
+    showModal(modalDialog("Initializing. Please wait.", footer=NULL))
+    initialize_stream()
+    change_log$commit = c()
+    change_log$current = list()
+    initialize_ui_value()
+    initialize_loadout()
+    initialize_saved_loadout_choices()
+    
+    execute_loadout()
+    gather_loadout_plot_data()
+    removeModal()
+  })
+  
+  observeEvent(input$apply_change, { 
+    showModal(modalDialog("Executing. Please wait", footer=NULL))
+    for (x in names(change_log$current)) {
+      if (x != "loadout") {
+
+        for (y in names(change_log$current[[x]])) {
+          for (z in names(change_log$current[[x]][[y]])) {
+            ui_value_saved[[x]][[y]][[z]] = ui_value[[x]][[y]][[z]]
+          }
+          
+          f = ui_private_list[[y]]
+          stream_list = getStreamByTransformation(x, f = f, s = stream)
+          #Check to make sure programs in stream_list match the program in x. 
+          #This seems to only be an issue with ICBM due to downstream logic
+          stream_list = stream_list[str_detect(stream_list, x)]
+          for (s in stream_list) {
+            if (is.null(ui_value[[x]][[y]]$year)) {
+              stream[[s]]$param = ui_value[[x]][[y]]$value
+            } else {
+              stream[[s]]$param[year_list %in% c(ui_value[[x]][[y]]$year[1]:ui_value[[x]][[y]]$year[2])] = ui_value[[x]][[y]]$value
+            }
+            updateDownstream(s, stream)
+          }
+        }
+   
+      } else {
+        # no operations necessary for loadout
+        # inputs have already been saved
+        # change_request_tree() will take care of prepping for actual execution of loadout
+      }
+    }
+  
+    
+    change_log$commit = c(change_log$commit, change_log$current)
+
+    output_txt = toJSON(change_log$commit, pretty = TRUE)
+    write(output_txt, paste0('results/', 'change_log.json'))
+    
+    change_log$current = list()
+    
+  })
+  
+  observeEvent(input$apply_change, ignoreInit = TRUE, {
+    change_request_tree()
+    execute_loadout()
+    gather_loadout_plot_data()
+    removeModal()
+  })
+  
+  observeEvent(input$history, { 
+    showModal(modalDialog("Loading file. Please wait", footer=NULL))
+    initialize_stream()
+    change_log$commit = c()
+    change_log$current = list()
+    initialize_ui_value()
+    initialize_loadout()
+    initialize_saved_loadout_choices()
+    
+    # read import file
+    change_log$current <- read_json(input$history$datapath, simplifyVector = TRUE)
+      
+    # apply changes for transformation and loadout
+    for (x_tmp in names(change_log$current)) {
+
+      x = str_split(string = x_tmp, pattern = "\\.", simplify = TRUE)[1]
+      
+      if (x != "loadout") {
+        for (y in names(change_log$current[[x_tmp]])) {
+    
+          for (z in names(change_log$current[[x_tmp]][[y]])) {
+ 
+            ui_value[[x]][[y]][[z]] = change_log$current[[x_tmp]][[y]][[z]]
+            ui_value_saved[[x]][[y]][[z]] = ui_value[[x]][[y]][[z]]
+          }
+          
+          f = ui_private_list[[y]]
+          stream_list = getStreamByTransformation(x, f = f, s = stream)
+
+          for (s in stream_list) {
+            if (is.null(ui_value[[x]][[y]]$year)) {
+              stream[[s]]$param = ui_value[[x]][[y]]$value
+            } else {
+              stream[[s]]$param[year_list %in% c(ui_value[[x]][[y]]$year[1]:ui_value[[x]][[y]]$year[2])] = ui_value[[x]][[y]]$value
+            }
+            updateDownstream(s, stream)
+          }
+        }
+      } else {
+
+        for (y in names(change_log$current[[x_tmp]]$loadout)) {
+          loadout_ui_value[[y]] = change_log$current[[x_tmp]]$loadout[[y]]
+        }
+      }
+    }
+    
+    change_log$commit = c(change_log$commit, change_log$current)
+    # print(change_log$commit)
+    output_txt = toJSON(change_log$commit, pretty = TRUE)
+    write(output_txt, paste0('results/', 'change_log.json'))
+    
+    change_log$current = list()
+    
+    change_request_tree()
+    execute_loadout()
+    gather_loadout_plot_data()
+    
+    removeModal()
+  })
+  
+  #### Control - Transformations ####
+  ui_value <- reactiveValues()
+  ui_value_saved <- reactiveValues()
+  req_reactive <- reactiveValues()
+  change_log <- reactiveValues()
+  
+  getStreamSrc <- function() {
+    src_list = c()
+    
+    for (x in names(stream)) {
+      if (is.null(stream[[x]]$upstream)) {
+        src_list = c(src_list, x)
+      }
+    }
+    
+    sort(src_list)
+  }
+  getStreamByTransformation <- function(x, f, s, x_list = NULL) {
+
+    if (!is.null(s[[x]]$transformation) && (s[[x]]$transformation == f)) {
+      x_list = c(x_list, x)
+    } else {
+      downstream = s[[x]]$downstream
+      if (!is.null(downstream)) {
+
+        for (x in downstream) {
+          x_list = getStreamByTransformation(x, f, s, x_list)
+        }
+      } else {
+        NULL
+      }
+    }
+    x_list
+  }
+  
+  initialize_ui_value <- function() {
+    for (x in getStreamSrc()) {
+      tmp = list()
+      for (y in ui_public_list) {
+        if(x %in% c("ICBM", "SSBN") && y !="limit"){
+          next
+        }
+        else{
+          
+          tmp[[y]] = list()
+          if (y != "delay") {
+            tmp[[y]][["year"]] = c(year_min, year_min)
+          }
+          f = ui_private_list[[y]]
+          x_list = getStreamByTransformation(x, f, stream_json)
+          tmp[[y]][["value"]] = stream_json[[x_list[1]]]$param[1]
+          
+          if(x %in% c("ICBM", "SSBN")){
+            tmp[["transformation"]] = "limit"
+          }
+          else{
+            tmp[["transformation"]] = "delay"
+          }
+          
+        }
+      }
+      ui_value[[x]] = tmp
+      ui_value_saved[[x]] = tmp
+    }
+    
+    req_reactive$value = req_value
+  }
+  
+  # render ui for user
+  output$select_src <- renderUI({
+    selectInput(inputId = "select_src",
+                label = "Platform/Weapon/Bomb/Warhead",
+                # choices = c("ALCM","GBSD"))
+                choices = isolate(getStreamSrc()))
+    
+    
+  })
+  
+  output$select_transformation <- renderUI({
+    x = input$select_src
+    if(!is.null(x)) {
+      
+      if(x == "ICBM" | x == "SSBN" ){
+        selectInput(inputId = "select_transformation",
+                    label = "Transformation",
+                    choices = 'limit',
+                    selected = ui_value[[x]]$transformation)
+      }
+      else{
+        selectInput(inputId = "select_transformation",
+                    label = "Transformation",
+                    choices = ui_public_list,
+                    selected = ui_value[[x]]$transformation) 
+      }
+    }
+  })
+  
+ observeEvent({input$select_src
+              input$select_transformation}, {
+     updateSelectInput(session, "select_transformation",
+                       label = "Transformation",
+                       
+                       if(input$select_src == "ICBM" | input$select_src == "SSBN" ){choices = 'limit'}
+                       else{choices = ui_public_list},
+                       selected = ui_value[[input$select_src]]$transformation)
+                })
+  
+  output$transformation_details_user <- renderUI({
+    x = input$select_src
+    # y = input$select_transformation
+    if (!is.null(x)) {
+      y = ui_value[[x]]$transformation
+      list(
+        if (y != "delay") {
+          sliderInput(inputId = "year", "Year range", min = year_min, max = year_max, value = ui_value[[x]][[y]][["year"]], sep = "")
+        },
+        numericInput(inputId = "value", "Value", value = ui_value[[x]][[y]][["value"]])
+      )
+    }
+  })
+  
+  # ui value reacts to changes in other inputs
+  observeEvent(input$select_transformation, {
+    x = input$select_src
+    y = input$select_transformation 
+    ui_value[[x]]$transformation = y
+  })
+  
+  # record input change
+  lapply(c("year","value"), function(z) {
+    observeEvent(input[[z]], ignoreInit = TRUE, {
+      if (!is.na(input[[z]])) {
+        x = input$select_src
+        y = input$select_transformation
+        f = ui_private_list[[y]]
+        ui_value[[x]][[y]][[z]] = input[[z]]
+
+        if (any(ui_value[[x]][[y]][[z]] != ui_value_saved[[x]][[y]][[z]])) {
+          if (is.null(change_log$current[[x]])) {
+            change_log$current[[x]] = list()
+          }
+
+          if (is.null(change_log$current[[x]][[y]])) {
+            change_log$current[[x]][[y]] = list()
+          }
+          change_log$current[[x]][[y]]$name = x
+          change_log$current[[x]][[y]]$transformation = ui_private_list[[y]]  # this needs to match actual function name rather than the name user sees
+          change_log$current[[x]][[y]][[z]] = input[[z]]
+        }
+      }
+    })
+  })
+  
+  #### Visualization - Plots ####
+  render_orientation <- function(tab_name) {
+    x = input$select_orientation
+    if (x == "Side-by-Side") {
+      list(
+        column(width = 6, 
+               h4("Baseline"),
+               plotlyOutput(sprintf("%s_plot_baseline", tab_name), height = plot_height)
+        ),
+        column(width = 6, 
+               h4("Change"),
+               plotlyOutput(sprintf("%s_plot", tab_name), height = plot_height)
+        )
+      )
+    } else if (x == "Baseline Only") {
+      list(
+        h4("Baseline"),
+        plotlyOutput(sprintf("%s_plot_baseline", tab_name), height = plot_height)
+      )
+    } else {
+      list(
+        h4("Change"),
+        plotlyOutput(sprintf("%s_plot", tab_name), height = plot_height)
+      )
+    }
+    
+  }
+
+  
+  render_plot_sbs <- function(plot_type, plot_df) {  
+    # plot_type = "line"
+    p = do.call(sprintf("plot_%s", plot_type), list(plot_df))
+    if (input$select_orientation == "Side-by-Side") {
+      # width = (((input$width-17) * 9/12 - 30) - 30) * 0.5 - 30
+      width = (((input$width) * panel_width_viz/12 - 30) - 30) * 0.5 - 30
+    } else {
+      # width = (((input$width-17) * 9/12 - 30) - 30)
+      width = (((input$width) * panel_width_viz/12 - 30) - 30)
+    }
+    ggplotly(p, width = width)
+  }
+  
+  gather_stream_data <- function(x, tab_root, s) {
+    # print(x)
+    # print(tab_root)
+    
+    plot_stream_list = c()
+    plot_stream_rev = list()
+    
+    if (tab_root %in% c("available", "limit")) {
+      if (input$sense == "Generated") {
+        tab_tmp = sprintf("%s_G", tab_root)
+      } else {
+        tab_tmp = sprintf("%s_D", tab_root)
+      }
+    } else {
+      tab_tmp = tab_root
+    }
+    
+    for (y in input$group_view) {
+      plot_stream = names(group)[grepl(pattern = sprintf("^%s.*%s$", group_view[[y]], tab_tmp), x = names(group))]
+      
+      plot_stream_list = c(plot_stream_list, plot_stream)
+      plot_stream_rev[[plot_stream]] = y # necessary for facetgrid labels
+    }
+    
+    tmp_list = list()
+    for (y in plot_stream_list) {
+      y_rev = plot_stream_rev[[y]]
+      tmp_list[[y_rev]] = list()
+
+      for (z in group[[y]][["in"]]) {
+        # z_src is the label used for plotting
+        z_src = str_split(z, "\\.", simplify = TRUE)[1]
+
+        
+        if (is.na(str_match(x, "param"))) {
+          tmp_list[[y_rev]][[z_src]] = s[[z]]$value
+        } else {
+          tmp_list[[y_rev]][[z_src]] = s[[z]]$param
+        }
+      }
+    }
+    
+    
+    plot_df = NULL
+    for (y in names(tmp_list)) {
+      col_list = names(tmp_list[[y]])
+      tmp_list[[y]]$year = year_list
+      tmp_df = data.frame(tmp_list[[y]], check.names = FALSE)
+      tmp_df$group = y
+      plot_df = rbind(plot_df, gather(tmp_df, stream, value, col_list))
+    }
+    plot_df
+
+  }
+  
+  lapply(names(tab_json), function(x) {
+    tab_root = str_split(string = x, pattern = "_", simplify = TRUE)[1]
+    
+    if (tab_root != "loadout") {
+      output[[x]] <- renderUI({ render_orientation(x) })
+    }
+    
+    observe({
+
+      if (tab_root != "loadout") {
+        # both plot_df must always be created to react to user input
+        plot_df_baseline = gather_stream_data(x, tab_root, stream_json)
+        plot_df = gather_stream_data(x, tab_root, stream)
+        
+        output[[sprintf("%s_plot_baseline", x)]] <- renderPlotly({ render_plot_sbs(tab_json[[x]]$plot_type, plot_df_baseline) })
+        output[[sprintf("%s_plot", x)]] <- renderPlotly({ render_plot_sbs(tab_json[[x]]$plot_type, plot_df) })
+      }
+      
+         })
+  })
+  
+  plot_line <- function(plot_df) {
+    p <- ggplot(data = plot_df, aes(x = year, y = value, color = stream)) +
+      geom_line(size = 1.5) +
+      geom_point(size = 2) +
+      facet_grid(rows = vars(group), scales = "free_y") +
+      scale_color_manual(values = plot_col) +
+      theme(legend.position = "none")+
+      labs(y = input$viz)
+}
+  
+  #### Control - Loadout Params ####
+  loadout_ui_value <- reactiveValues()
+  loadout_ui_route <- reactiveValues()
+  
+  # creating variables to hold values of user choices for loadout...
+  initialize_saved_loadout_choices <- function() {
+
+    
+
+    lapply(user_choice_list, function(x) {
+
+      name_split = str_split(x, "_", simplify = TRUE)
+
+      n = length(name_split)
+      name_q = name_split[n]
+      
+      if (n > 2) {
+        
+        name_leaf = name_split[n-1]
+        name_parent_prefix = paste(name_split[1:(n-2)], collapse="`$children$`")
+        name_parent_prefix = paste0("`",name_parent_prefix,"`")
+      } else {
+        name_leaf = NULL
+        name_parent_prefix = NULL
+      }
+      
+      name_prefix = paste(name_split[1:(n-1)], collapse="`$children$`")
+      name_prefix = paste0("`",name_prefix,"`")
+      
+      if (name_q == "year") {
+        loadout_ui_value[[x]] = c(year_list[1],year_list[1])
+      } else if (name_q == "q.x") {
+
+        tmp_df = eval(parse(text=sprintf("triad_request_df_tree$%s$q", name_prefix)))
+
+        tmp_df = tmp_df %>% filter(year == year_list[1])
+        q = min(tmp_df$q.x) # all values should be the same...
+
+        if (!is.null(q)) { loadout_ui_value[[x]] = q }
+        
+      } else {
+
+        name_prefix = paste(name_split[1:(n-2)], collapse="`$children$`")
+        name_prefix = paste0("`",name_prefix,"`")
+
+        tmp_df = eval(parse(text=sprintf("triad_request_df_tree$%s$q", name_prefix)))
+
+        tmp_df = tmp_df %>% filter(year == year_list[1])
+   
+        tmp_df = tmp_df[, c("child", "q.y")]
+
+        if (!is.null(tmp_df$q.y) && !any(is.nan(tmp_df$q.y))) {
+          q = tmp_df[tmp_df$child == name_q,]$q.y
+          loadout_ui_value[[x]] = q
+
+        }
+      }
+    })
+  }
+  
+  render_children_list <- function(node, i) {
+    children = node$children
+    children_with_children = c()
+    for (child in children) {
+      if ((is.null(node$request_consolidated) | is.null(node$children_dist)) 
+          && has_children(child)) {
+        children_with_children = c(children_with_children, child$name)
+      }
+    }
+    if (!is.null(children_with_children)) {
+      selectInput(inputId = sprintf("loadout_%i", i), 
+                  label = sprintf("Select %s Program", node$name), 
+                  choices = children_with_children)
+    }
+  }
+  
+  render_loadout_details <- function(node,i) {
+    print("rendering ui for loadout details")
+    if (has_children(node)) {
+      input_name_list = c()
+      for (j in c(0:i)) {
+        # print(isolate(input[[sprintf("select_child_%s",j)]]))
+        input_name_list = c(input_name_list, isolate(input[[sprintf("loadout_%s",j)]])[[1]])
+      }
+      # print(input_name_list)
+      input_name = paste(input_name_list, collapse = "_")
+      # print(input_name)
+      
+      children = node$children
+      children_names = names(children)
+      inputId = sprintf("loadout_%i",i)
+      fluidRow(
+        if ((!is.null(node$request_consolidated) | !is.null(node$children_dist)) & (i>0) 
+            & (node$name %in% entities_df$program)
+            ) {
+          print(sprintf("%s_year",input_name))
+          print(loadout_ui_value[[sprintf("%s_year",input_name)]])
+          column(
+            12,
+            sliderInput(inputId = sprintf("%s_year", input_name), label = "Year range",
+                        # value = c(year_min, year_max),
+                        value = loadout_ui_value[[sprintf("%s_year",input_name)]],
+                        min = year_min, max = year_max,
+                        step = 1, sep = "")
+          )
+        },
+        if (!is.null(node$request_consolidated) & (i>0)
+            & (node$name %in% entities_df$program)
+            ) {
+          print(sprintf("%s_q.x",input_name))
+          print(loadout_ui_value[[sprintf("%s_q.x",input_name)]])
+          column(
+            12
+            ,numericInput(sprintf("%s_q.x",input_name), node$value_name,
+                          # value=node$request_consolidated,
+                          value=loadout_ui_value[[sprintf("%s_q.x",input_name)]], 
+                          min=0, step=1)
+          )
+        },
+        if (!is.null(node$children_dist) & (i>0)) {
+          children_dist = unlist(node$children_dist)
+
+          column_width = 6
+          lapply(1:length(children), function(i) {
+            child_name = children_names[i]
+            child_value = children_dist[i]
+
+            print(sprintf("%s_q.y_%s",input_name,child_name))
+            print(loadout_ui_value[[sprintf("%s_q.y_%s",input_name,child_name)]])
+            if (!is.null(node$request_consolidated)) {
+              value_max = 1
+              value_step = 0.01
+            } else {
+              value_max = 10
+              value_step = 1
+            }
+            column(
+              column_width,
+              numericInput(sprintf("%s_q.y_%s",input_name,child_name),
+                           child_name,
+                           value=loadout_ui_value[[sprintf("%s_q.y_%s",input_name,child_name)]], 
+                           min=0, max=value_max, step=value_step)
+            )
+          })
+        }
+        ,
+        column(12, render_children_list(node, i+1),
+               
+               helpText(node$help_text))
+      )
+    }
+  }
+  
+  # reactive rendering for loadout ui
+  lapply(c(0:3), function(i) {
+    lapply(c(0:i), function(k) {
+      inputId = sprintf("loadout_%i",k)
+      observeEvent(c(input[[inputId]]), priority = 5-k, {
+        loadout_ui_route[[inputId]] = input[[inputId]]
+        route = c()
+        tmp_route = c()
+        no_null = TRUE
+        for (j in c(0:i)) {
+          tmpId = sprintf("loadout_%i",j)
+
+          if (is.null(input[[tmpId]])) { no_null = FALSE }
+          route = c(route, input[[tmpId]])
+          
+          if (length(tmp_route) > 0) {
+            tmp_route_joined = paste(tmp_route, collapse = "`$children$`")
+            tmp_route_joined = paste0("`",tmp_route_joined,"`")
+            tmp_node = eval(parse(text=sprintf("logic$%s",tmp_route_joined)))
+            if (!has_children(tmp_node) | 
+                (!is.null(input[[tmpId]]) && !(input[[tmpId]] %in% names(tmp_node$children)))) {
+              no_null = FALSE
+            }
+          }
+          tmp_route = c(tmp_route, input[[tmpId]])
+        }
+        
+        inputId = sprintf("loadout_details_%i",i)
+        if (no_null) {
+          route = paste(route, collapse = "`$children$`")
+          route = paste0("`",route,"`")
+          # print(route)
+          node = eval(parse(text=sprintf("logic$%s",route)))
+          
+          output[[inputId]] = renderUI({ render_loadout_details(node, i) })
+        } else {
+          output[[inputId]] = NULL
+        }
+      })
+    })
+  })
+  
+  # wait for changes in any of the loadout inputs...
+  lapply(user_choice_list, function(x) {
+    observeEvent(input[[x]], priority = 5, {
+      
+      conditional_expr = "!is.na(input[[x]])"
+      conditional_expr = sprintf("%s & input[[x]] >= %f", conditional_expr, 0)
+      
+      if (eval(parse(text=conditional_expr))) {
+        if (!is.null(input[[x]])
+            && any(loadout_ui_value[[x]] != input[[x]])) {
+          #print(sprintf("updating %s",x))
+          loadout_ui_value[[x]] = input[[x]]
+
+          if (is.null(change_log$current$loadout)) {
+            change_log$current$loadout = list()
+            change_log$current$loadout$loadout = list() # purely for formatting when printing summary of changes
+          }
+          change_log$current$loadout$loadout[[x]] = loadout_ui_value[[x]]
+        }
+      }
+    })
+  })
+  
+  #### Control - Loadout Operations ####
+  loadout <- reactiveValues()
+  initialize_loadout <- function() {
+    loadout$request_df_tree = baseline_request_df_tree
+  }
+  
+  change_request_tree <- function() {
+    for (name in names(user_choice_group_list)) {
+      input_group = user_choice_group_list[[name]]
+      
+      name_split = str_split(name, "_", simplify = TRUE)
+      tree_route = paste(name_split, collapse="`$children$`")
+      tree_route = paste0("`",tree_route,"`")
+      
+      tmp_df = eval(parse(text = sprintf("loadout$request_df_tree$%s$q",tree_route)))
+      
+      for (input_name in input_group) {
+        input_name_split = str_split(input_name, "_", simplify = TRUE) 
+        n = length(input_name_split)
+        if (input_name_split[n] == "year") {
+          year_new = loadout_ui_value[[input_name]]
+  
+        } else if (input_name_split[n] == "q.x") {
+          q.x_new = loadout_ui_value[[input_name]]
+          tmp_df = tmp_df %>% mutate(q.x = ifelse(eval(parse(text=paste0("year %in% ",year_new[1],":",year_new[2]))),
+                                                  q.x_new,
+                                                  q.x))
+          
+        } else {
+          q.y_new = loadout_ui_value[[input_name]]
+          child_tmp = input_name_split[n]
+          tmp_df = tmp_df %>% mutate(q.y = ifelse(eval(parse(text=paste0("year %in% ",year_new[1],":",year_new[2],
+                                                                         " & child == \"",child_tmp,"\""))),
+                                                  q.y_new,
+                                                  q.y))
+        }
+      }
+      eval(parse(text = sprintf("loadout$request_df_tree$%s$q = tmp_df",tree_route)))
+    }
+  }
+  
+  execute_loadout <- function() {
+    # execute loadout
+    
+    for (case in c("Generated", "Day to Day")) {
+      input_df = NULL
+      
+      for (x in group[[case]][["in"]]) {
+        tmp = list()
+        x_value = stream[[x]]$value
+        tmp$year = year_list
+        tmp$n_op_available = x_value
+        
+        tmp = data.frame(tmp)
+        tmp$program = str_split(string = x, pattern = "\\.", simplify = TRUE)[1]
+        
+        input_df = rbind(input_df, tmp)
+      }
+      
+      loadout(input_df, loadout$request_df_tree$ICBM, case)
+      loadout(input_df, loadout$request_df_tree$SSBN, case)
+      loadout(input_df, loadout$request_df_tree$Bomber, case)
+    }
+  }
+  
+  gather_loadout_plot_data <- function() {
+  
+    if (is.null(loadout$received)) {
+      loadout$received = list()
+    }
+    
+    for (case in c("Generated", "Day to Day")) {
+      loadout$received[[case]] = NULL
+      
+      received_files = list.files(sprintf("./results/%s",case),"received")
+      
+      for (fname in received_files) {
+
+        tmp_df = read.csv(paste0(sprintf("./results/%s/",case),fname))
+        
+        fname_no_ext = str_split(fname, "\\.", simplify = TRUE)[1]
+        fname_split = str_split(fname_no_ext, "_", simplify = TRUE)
+        n = length(fname_split)
+        
+        # I speculate that sapply is similiar to unlist(lapply(...))
+        tmp_df$route_length_tmp = sapply(tmp_df$request_route, 
+                                         function(x) { 
+                                           x_split = str_split(x, "_", simplify = TRUE)
+                                           x_keep = c()
+                                           for (y in x_split) {
+                                             if (y %in% entities_df$program) {
+                                               x_keep = c(x_keep, y)
+                                             }
+                                           }
+                                           length(x_keep) })
+        
+        tmp_df$substitute = sapply(tmp_df$child, function(x) {
+          if (length(str_split(x, "_", simplify = TRUE)) > 1) {
+            TRUE
+          } else {
+            FALSE
+          } 
+        })
+        tmp_df$child_tmp = mapply(
+          function(x,y) {
+            if (x) {
+              str_split(y, "_", simplify = TRUE)[2]
+            } else {
+              # cannot just pass y for some reason because for some rows, y is returned as a number
+              str_split(y, "_", simplify = TRUE)[1]
+            }
+          },
+          tmp_df$substitute,
+          tmp_df$child
+        )
+        
+        tmp_df$leg <- sapply(tmp_df$request_route, function(x) { str_split(x, "_", simplify = TRUE)[1] })
+        
+        tmp_df$route_list <- lapply(tmp_df$request_route, 
+                                    function(x) { 
+                                      x_split = str_split(x, "_", simplify = TRUE)
+                                      x_keep = c()
+                                      for (y in x_split) {
+                                        if (y %in% entities_df$program) {
+                                          x_keep = c(x_keep, y)
+                                        }
+                                      }
+                                      x_keep
+                                    })
+        tmp_df$label_tmp <- sapply(tmp_df$route_list, function(x) { 
+          if (is.null(x)) {
+            NULL
+          } else {
+            paste(x, collapse = "_") 
+          }
+        })
+        # print(unique(tmp_df$label_tmp))
+        tmp_df$label <- mapply(
+          function(x,y) {
+            if (is.null(x)) { 
+              y 
+            }
+            else { 
+              str_replace_all(paste(x, y, sep = "_"),"_"," ")
+            }
+          },
+          tmp_df$label_tmp, 
+          tmp_df$child
+        )
+        loadout$received[[case]] = rbind(loadout$received[[case]], tmp_df)
+      }
+    }
+  }
+  
+  #### Visualization - Loadout ####
+  observe({
+    
+    selected_route = NULL
+    selected_route_list = NULL
+    if (input$dials == "loadout") {
+      for (x in sort(names(loadout_ui_route))) {
+        selected_route = c(selected_route, loadout_ui_route[[x]])
+        selected_route_list = c(selected_route_list, paste(selected_route, collapse = "_"))
+        # print(selected_route_list)
+      }
+    }
+    
+    tree_df = get_request_tree_all(loadout$request_df_tree$ICBM)
+    tree_df = get_request_tree_all(loadout$request_df_tree$SSBN, tree_df)
+    tree_df = get_request_tree_all(loadout$request_df_tree$Bomber, tree_df)
+    tree_df = tree_df %>% filter(!(route %in% c("ICBM","SSBN","Bomber")))
+    
+    if (!is.null(selected_route_list) & input$dials == "loadout") {
+      tree_df = tree_df %>% filter(route %in% selected_route_list)
+      facet_grid_label = "parent"
+    } else {
+      facet_grid_label = "leg"
+    }
+    
+    plot_df = tree_df %>% group_by(route, year) %>% summarise(q.x = min(q.x))
+    plot_df$leg = sapply(plot_df$route, function(x) { str_split(x, "_", simplify = TRUE)[1] })
+    plot_df$parent = sapply(plot_df$route, function(x) { 
+      n = length(str_split(x, "_", simplify = TRUE))
+      str_split(x, "_", simplify = TRUE)[n] })
+    
+    qx_df = na.omit(plot_df[,c("year","q.x","route",facet_grid_label)])
+    output[["loadout_param_q.x"]] <- renderPlotly({
+      if (nrow(qx_df) > 0) {
+        p <- ggplot() +
+          geom_line(data = qx_df, aes(x = year, y = q.x, color = route), size = 1.5) +
+          geom_point(data = qx_df, aes(x = year, y = q.x, color = route), size = 2) +
+          facet_grid(rows = vars(!!sym(facet_grid_label)), scales = "free_y") +
+          theme(legend.position = "none")
+      }
+    })
+    
+    tree_df$leg = sapply(tree_df$route, function(x) { str_split(x, "_", simplify = TRUE)[1] })
+    tree_df$full_route = mapply(function(x,y) { paste(x, y, sep = "_") }, tree_df$route, tree_df$child)
+    tree_df$parent = sapply(tree_df$route, function(x) { 
+      n = length(str_split(x, "_", simplify = TRUE))
+      str_split(x, "_", simplify = TRUE)[n] })
+    
+    qy_df = na.omit(tree_df[,c("year","q.y","full_route",facet_grid_label)])
+    
+    output[["loadout_param_q.y"]] <- renderPlotly({
+        if (nrow(qy_df) > 0) {
+          p <- ggplot() +
+            geom_line(data = qy_df, aes(x = year, y = q.y, color = full_route), size = 1.5) +
+            geom_point(data = qy_df, aes(x = year, y = q.y, color = full_route), size = 2) +
+            facet_grid(rows = vars(!!sym(facet_grid_label)), scales = "free_y") +
+            theme(legend.position = "none")
+        }
+    })
+  })
+
+  renderPlotly_wrapper <- function(x) {
+    if (is.null(x)) {
+      NULL
+    } else {
+      renderPlotly({ ggplotly(x) })
+    }
+  }
+
+  renderPlotly_loadout_set <- function(outputIdBase, figureIdBase) {
+    lapply(c("","_baseline"), function(x) {
+      figureId = sprintf("%s%s", figureIdBase, x)
+      outputId = sprintf("%s%s", outputIdBase, x)
+      
+      output[[outputId]] <- renderPlotly_wrapper(figures[[figureId]])
+    })
+  }
+
+  show_loadout <- function() {
+    lapply(type_list, function(type) {
+      outputId = sprintf("loadout_%s_plot",type)
+      plotId = sprintf("%s_%s_%s", outputId, input$sos_leg, input$sense)
+
+      if (input$sos_detail == "Summary") {
+        if (!is.null(figures[[sprintf("%s_1", plotId)]])) {
+          plotId = sprintf("%s_1", plotId)
+        }
+      } else if (input$sos_detail == "Weapon-Level") {
+        if (!is.null(figures[[sprintf("%s_2", plotId)]])) {
+          plotId = sprintf("%s_2", plotId)
+        }
+        else if (input$sos_leg == "ICBM") { # don't want to do this, but can't think of better alternative yet
+          plotId = sprintf("%s_1", plotId)
+        }
+      } else if(input$sos_detail == "Warhead-Level") {
+        if (!is.null(figures[[sprintf("%s_hide_substitute", plotId)]])) {
+          plotId = sprintf("%s_hide_substitute", plotId)
+        }
+      }
+  
+      if (input$sos_leg == "ICBM" && type == "Platform") {
+        output[[outputId]] = NULL
+        output[[sprintf("%s_baseline",outputId)]] = NULL
+      } else if (input$sos_leg == "ICBM" && type == "Weapon") {
+        figureId = sprintf("loadout_Platform_plot_%s_%s",input$sos_leg,input$sense)
+        renderPlotly_loadout_set(outputId, figureId)
+      } else {
+        renderPlotly_loadout_set(outputId, plotId)
+      }
+    })
+    req_ggplot()
+    }
+
+  loadout_ggplot <- function(plot_df, type, fill, plot_color) {
+    label = plot_df[[fill]]
+
+    p <- ggplot(plot_df, aes(x = year, y = q, fill = label)) +
+      geom_bar(stat="identity", color = "black", size = 0.25) +
+      scale_fill_manual(values = plot_color) +
+      labs(y = sprintf("%s Count", type)) +
+      theme_linedraw() +
+
+      theme(axis.title.x = element_blank(),
+            plot.title = element_text(size = 14, hjust = 0.5),
+            # plot.title = element_text(size = 14, hjust = 0, vjust = 0),
+            legend.title = element_blank(),
+            legend.text = element_text(size=10),
+            axis.text = element_text(size=10),
+            panel.grid.major = element_line(colour = "gray92"),
+            panel.grid.minor = element_blank())
+  }
+
+  figures <- reactiveValues()
+  lapply(rev(levels(type_list)), function(type) {
+    outputId = sprintf("loadout_%s", type)
+    output[[outputId]] <- renderUI({ render_orientation(outputId) })
+  })
+  
+  create_p_loadout <- function(){
+
+    for (case in c("Generated", "Day to Day")) {
+      tmp_df = loadout$received[[case]]
+      for (l in c("Triad", triad_levels)) {
+        if (l == "Triad") {
+          leg_df = tmp_df
+        } else {
+          leg_df = tmp_df %>% filter(leg == l)
+        }
+       
+          s = case
+          sense_df = leg_df
+          for (type in type_list) {
+            program_list = entities_df[entities_df$type == type,]$program
+            
+            plot_df = sense_df %>% filter(child_tmp %in% program_list)
+            n = max(plot_df$route_length_tmp)
+            plot_df = plot_df %>% filter(q != 0)
+            
+            if (dim(plot_df)[1] == 0) {
+              # create empty data.frame to plot
+              # with the current set up, cannot set plot to NULL
+              plot_df = expand.grid(year_list,0, n, NA, NA, NA)
+              colnames(plot_df) = c("year","q","route_length_tmp","route_list","child_tmp","label")
+            }
+            
+            if (n > 0) {
+         
+              for (i in c(1:n)) {
+                plot_df$group_label = sapply(
+                  plot_df$route_list,
+                  function(x) {
+                    if (x[1] %in% c("GBSD","Minuteman") && type == "Warhead/Bomb" && i == 2) {
+                      x[1]
+                    } else {
+                      paste(x[1:min(i,length(x))], collapse = "_")
+                    }
+                    
+                  })
+                
+                test_df = plot_df[,c("year","group_label","q")] %>% group_by(year,group_label) %>% summarise(q = sum(q))
+                test_df$group_color <- sapply(test_df$group_label,
+                                              function(x) {
+                                                x_split = str_split(x, "_", simplify = TRUE)
+                                                eval(parse(text = sprintf("plot_col$`%s`",x_split[length(x_split)])))
+                                              })
+                test_df$group_label <- sapply(test_df$group_label, function(x) { str_replace_all(x, "_", " ") })
+                test_df$group_label <- factor(test_df$group_label, label_levels)
+                
+                color_df = unique(test_df[,c("group_color","group_label")])
+                plot_color = color_df$group_color
+                names(plot_color) = color_df$group_label
+                plot_color[["gap"]] = "red"
+                
+                plotId = sprintf("loadout_%s_plot_%s_%s_%i",type,l,s,i)
+          
+                p = loadout_ggplot(test_df, type, "group_label", plot_color)
+                figures[[plotId]] = p
+                if (is.null(figures[[sprintf("%s_baseline", plotId)]])) {
+                  figures[[sprintf("%s_baseline", plotId)]] = p
+                }
+             
+              }
+            }
+            
+            if (type == "Warhead/Bomb") {
+              plot_df$group_label = mapply(
+                function(x,y) { paste(paste(x, collapse = "_"), y, sep = "_") },
+                plot_df$route_list,
+                plot_df$child_tmp)
+              
+              test_df = plot_df[,c("year","group_label","q")] %>% group_by(year,group_label) %>% summarise(q = sum(q))
+              
+              test_df$group_color <- sapply(test_df$group_label,
+                                            # function(x) { plot_col[[x]] })
+                                            function(x) {
+                                              x_split = str_split(x, "_", simplify = TRUE)
+                                              color_key = x_split[[length(x_split)]]
+                                              eval(parse(text = sprintf("plot_col$`%s`",color_key))) })
+              test_df$group_label <- sapply(test_df$group_label, function(x) { str_replace_all(x,"_"," ") })
+              test_df$group_label <- factor(test_df$group_label, label_levels)
+          
+              
+              color_df = unique(test_df[,c("group_color","group_label")])
+              plot_color = color_df$group_color
+              names(plot_color) = color_df$group_label
+              plot_color[["gap"]] = "red"
+              plotId = sprintf("loadout_%s_plot_%s_%s_hide_substitute",type,l,s)
+          
+              p = loadout_ggplot(test_df, type, "group_label", plot_color)
+              figures[[plotId]] = p
+              if (is.null(figures[[sprintf("%s_baseline", plotId)]])) {
+                figures[[sprintf("%s_baseline", plotId)]] = p
+              }
+            }
+            
+            plot_df$group_color <- sapply(plot_df$child_tmp,
+                                          function(x) { eval(parse(text = sprintf("plot_col$`%s`",x))) })
+            
+            # assign order of labels to show
+            plot_df$label <- factor(plot_df$label, label_levels)
+            
+            # assign colors to labels
+            color_df = unique(plot_df[,c("group_color","label")])
+            plot_color = color_df$group_color
+            names(plot_color) = color_df$label
+            plot_color[["gap"]] = "red"
+            
+            plot_df$group_label = plot_df$label
+            p = loadout_ggplot(plot_df[,c("year","group_label","q","group_color","label")], type, "label", plot_color)
+            plotId = sprintf("loadout_%s_plot_%s_%s",type,l,s)
+            figures[[plotId]] = p
+            if (is.null(figures[[sprintf("%s_baseline", plotId)]])) {
+              figures[[sprintf("%s_baseline", plotId)]] = p
+            }
+
+        }
+      }
+    }
+  }
+  
+  observeEvent(loadout$received, priority = 5, { 
+ 
+    create_p_loadout()
+    
+    show_loadout()
+  })
+  
+  observeEvent(c(input$sos_leg, input$sense, input$sos_detail), priority = 5, {
+
+    show_loadout()
+    
+  })
+  
+  #### Visualization - Loadout Requirement ####
+  
+  output$requirement_title <- renderUI({
+    tags$div(
+      class = "form-group shiny-input-container",
+      tags$label(class = "control-label", sprintf("%s: %s", input$sense, input$sos_leg))
+    )
+  })
+  
+  output$requirement <- renderUI({
+    list(
+      fluidRow(
+        column(
+          12,
+          lapply(req_list, function(x) {
+            numericInput(inputId = x, label = x, req_reactive$value[[input$sos_leg]][[input$sense]][[x]])
+          })
+        )
+      )
+    )
+  })
+  
+  output$req_view <- renderUI({checkboxGroupInput("req_view", "Display Requirement", req_list, req_reactive$view, inline = TRUE)})
+  
+  req_view_debounced <- reactive({input$req_view}) %>% debounce(1000)
+  observeEvent(req_view_debounced(), ignoreInit = TRUE, ignoreNULL = FALSE, {
+
+    req_reactive$view <- req_view_debounced()
+  })
+  
+  # add requirement line for loadout plot
+  req_ggplot <- function() {
+    req_show = list() 
+    print(req_reactive$view)
+    for (x in req_reactive$view) {
+      req_show[[x]] = req_reactive$value[[input$sos_leg]][[input$sense]][[x]]
+    }
+  
+    
+    if (length(req_show) > 0) {
+      outputIdBase = "loadout_Warhead/Bomb_plot"
+      figureIdBase = "loadout_Warhead/Bomb_plot"
+      
+      figureIdBase = sprintf("%s_%s_%s",figureIdBase, input$sos_leg, input$sense)
+      if (input$sos_detail != "Substitution-Level") {
+        figureIdBase = sprintf("%s_%s", figureIdBase, detail_suffix[[input$sos_detail]])
+      }
+      
+      if (input$sos_leg == "ICBM" && input$sos_detail == "Weapon-Level") {
+        figureIdBase = sprintf("loadout_Platform_plot_%s_%s", input$sos_leg, input$sense)
+      }
+      
+      
+      
+      lapply(c("","_baseline"), function(x) {
+        figureId = sprintf("%s%s", figureIdBase, x)
+        p = figures[[figureId]]
+        
+        
+        
+        max_req = max(unlist(req_show))
+  
+        q_df = p$data %>% group_by(year) %>% summarise(q = sum(q))
+        q_df$q = pmax(0, max_req - q_df$q)
+        q_df$group_label = "gap"
+        q_df$label = "gap"
+        q_df$group_color = "red"
+        q_df[[".group"]] = q_df$year - min(q_df$year) + 1
+        
+        if (is.na(p$data$group_label)) {
+          p$data$group_label <- factor("gap", label_levels) 
+          
+          p$data$group_color = q_df$group_color
+          
+          p$data$label = p$data$group_label
+          p$data = bind_rows(p$data, q_df)
+          p$data$label <- factor(p$data$label, label_levels)
+          
+          
+        } else {
+          
+          p$data$label = p$data$group_label
+          p$data = bind_rows(p$data, q_df)
+          p$data$label <- factor(p$data$label, label_levels)
+          
+        }
+
+  
+        for (req_name in names(req_show)) {
+          label = req_name
+          label_x = year_min
+          label_y = req_show[[req_name]]
+          p = p + 
+            annotate("text", x = label_x, y = label_y, label = label) +
+            geom_hline(yintercept = label_y, linetype = 2)
+        }
+        outputId = sprintf("%s%s",outputIdBase,x)
+        output[[outputId]] <- renderPlotly({ ggplotly(p) %>% style(textposition = "top") })
+      })
+    }
+  }
+  observeEvent(req_reactive$view, ignoreInit = TRUE, ignoreNULL = FALSE, priority = 5, { 
+    print("change observed")
+    #If the all the boxes are unchecked, return to the orginal plots without the requirements
+    if(is.null(req_reactive$view)){
+      create_p_loadout()
+      
+      show_loadout()
+    }else{
+      req_ggplot() 
+      
+    }
+    
+  })
+  lapply(req_list, function(x){
+    observeEvent(input[[x]], ignoreInit = TRUE, {
+      # print("value change observed")
+      req_reactive$value[[input$sos_leg]][[input$sense]][[x]] = input[[x]]
+    })
+  })
+  lapply(names(req_value), function(x){
+    X = req_value[[x]]
+    lapply(names(X), function(y) {
+      Y = X[[y]]
+      lapply(names(Y), function(z) {
+        observeEvent(req_reactive$value[[x]][[y]][[z]], ignoreInit = TRUE, {
+          req_ggplot()
+        })
+      })
+    })
+  })
+  
+  #### Changelog UIs ####
+  output$changelog <- renderUI({
+    text_list = c()
+    i = 0
+    for (change in change_log$commit) {
+      i = i + 1
+      for (y in change) {
+        text = toJSON(y, pretty = TRUE)
+        text = str_replace_all(text,'\\{.*\\n*',"")
+        text = str_replace_all(text,'[}\\]].*\\n*',"<br/>")
+        text = str_replace_all(text,'["\\[]',"")
+        text_list = c(text_list, text)
+      }
+    }
+
+    HTML(paste(text_list, collapse = ''))
+  })
+  
+  #### Super User ####
+  observeEvent(input$super, {
+    if (input$super) {
+      lapply(super_list, function(x) showTab(inputId = "viz", target = x))
+    } else {
+      lapply(super_list, function(x) hideTab(inputId = "viz", target = x))
+    }
+  })
+  
+  #### Control - Spreadsheet (Super User) ####
+  output$transformation <- renderUI({
+    selectInput(
+      inputId = "transformation", # there might also be input$select_transformation
+      label = "Select Transformation",
+      choices = transformation_list
+    )
+  })
+  
+  output$transformation_details <- renderUI({
+    f = input$transformation
+    if (!is.null(f) && (f != "baseline")) {
+      selectInput(
+        inputId = "upstream",
+        label = "Select Upstream",
+        choices = transformation[[f]]$upstream_choices
+      )
+    } else {
+      textInput(
+        inputId = "baseline",
+        label = "Stream Name"
+      )
+    }
+  })
+  
+  setKey <- function(x,f) { sprintf("%s.%s",x,f) }
+  updateUpstreamChoice <- function(x,x_upstream) {
+    for (f in names(transformation)) {
+      if (is.na(str_match(x,f))) {
+        transformation[[f]]$upstream_choices = c(transformation[[f]]$upstream_choices, x)
+      } else {
+        transformation[[f]]$upstream_choices = transformation[[f]]$upstream_choices[transformation[[f]]$upstream_choices != x_upstream]
+      }
+    }
+  }
+  
+  observeEvent(input$add_stream, priority = 5, {
+    f_input = input$transformation
+    if (f_input == "baseline") {
+      x = input$baseline
+      
+      if (is.null(stream[[x]])) {
+        stream[[x]] = list()
+        stream[[x]]$value = reactive_df$data[["value"]]
+        updateTextInput(session = session, inputId = "baseline", value = "")
+      }
+    } else {
+      x = input$upstream
+      downstream = setKey(x,f_input)
+      
+      if (is.null(stream[[x]]$downstream)) {
+        stream[[x]]$downstream = c()
+      }
+      stream[[x]]$downstream = c(stream[[x]]$downstream, downstream)
+      stream[[downstream]] = list()
+      
+      if (f_input == "delay") {
+        param = 0
+      } else {
+        param = reactive_df$data[[f_input]]
+      }
+      
+      # stream[[downstream]]$value = rep(50, year_n)
+      x_value = stream[[x]]$value
+      stream[[downstream]]$transformation = f_input
+      stream[[downstream]]$value = do.call(f_input, list(x_value, param))
+      stream[[downstream]]$param = param
+      
+      if (is.null(stream[[downstream]]$upstream)) {
+        stream[[downstream]]$upstream = c()
+      }
+      stream[[downstream]]$upstream = c(stream[[downstream]]$upstream, x)
+      
+      # the only time this function is used, so it will never run for the average user...
+      updateUpstreamChoice(downstream, x)
+    }
+    
+    for (z in names(group)) {
+      group[[z]]$out = c(group[[z]]$out, downstream)
+    }
+  })
+  
+  observeEvent(c(input$transformation, input$upstream), {
+    f_input = input$transformation
+    col_disable = c()
+    col_autofill = c()
+    if (!is.null(f_input)) {
+      tmp_df = list()
+      tmp_df[["year"]] = year_list
+      col_disable = c(col_disable, 1)
+      
+      
+      if (f_input == "baseline") {
+        tmp_df[["value"]] = rep(0, year_n)
+        col_autofill = c(col_autofill, 2)
+      } else {
+        x = input$upstream
+        if (!is.null(x) && x != "") {
+          downstream = setKey(x,f_input)
+          print(x)
+          tmp_df[[x]] = stream[[x]]$value
+          col_disable = c(col_disable, 2)
+          if (f_input != "delay") {
+            tmp_df[[f_input]] = rep(0, year_n)
+            # tmp_df[[f_input]] = c(100, rep(0, year_n-1))
+            col_autofill = c(col_autofill, 3)
+          }
+        }
+      }
+      
+      reactive_df$data = data.frame(tmp_df, check.names = FALSE)
+      reactive_df$col_disable = col_disable
+      reactive_df$col_autofill = col_autofill
+    }
+  })
+  
+  output$param_spreadsheet <- renderDataTable({
+    # output$param_spreadsheet <- renderDT({
+    datatable(
+      reactive_df$data,
+      extensions = 'AutoFill',
+      callback = JS(callback),
+      options = list(pageLength = year_n,
+                     scrollX = TRUE, 
+                     scrollY = "65vh",
+                     scrollCollapse = TRUE,
+                     autoFill = list(columns = reactive_df$col_autofill, focus = 'click')),
+      editable = list(target = "column", disable = list(columns = reactive_df$col_disable))
+    )
+  }, server = TRUE)
+  
+  reactive_df <- reactiveValues()
+  
+  observeEvent(input$param_spreadsheet_cell_edit, {
+    reactive_df$data <<- editData(reactive_df$data,
+                                  input$param_spreadsheet_cell_edit,
+                                  proxy = "param_spreadsheet")
+  })
+  
+  observeEvent(input$param_spreadsheet_cells_filled, {
+    reactive_df$data <<- editData(reactive_df$data,
+                                  input$param_spreadsheet_cells_filled,
+                                  proxy = "param_spreadsheet")
+  })
+  
+  callback <- c(
+    "var tbl = $(table.table().node());",
+    "var id = tbl.closest('.datatables').attr('id');",
+    "table.on('autoFill', function(e, datatable, cells){",
+    "  var out = [];",
+    "  for(var i = 0; i < cells.length; ++i){",
+    "    var cells_i = cells[i];",
+    "    for(var j = 0; j < cells_i.length; ++j){",
+    "      var c = cells_i[j];",
+    "      var value = c.set === null ? '' : c.set;", # null => problem in R
+    "      out.push({",
+    "        row: c.index.row + 1,",
+    "        col: c.index.column,",
+    "        value: value",
+    "      });",
+    # to color the autofilled cells, uncomment the two lines below  
+    #  "      $(table.cell(c.index.row, c.index.column).node())",
+    #  "        .css('background-color', 'yellow');",
+    "    }",
+    "  }",
+    "  Shiny.setInputValue(id + '_cells_filled:DT.cellInfo', out);",
+    "  table.rows().invalidate();", # this updates the column type
+    "});"
+  )
+  
+  output$stream_list <- renderPrint({
+    for (x in sort(names(stream))) {
+      print.noquote(x)
+    }
+  })
+  
+  output$select_stream <- renderUI({ 
+    if (
+      # input$spreadsheet_view == "Transformations" && 
+      length(names(stream)) > 0) {
+      selectInput(
+        inputId = "stream",
+        label = "Select Stream",
+        choices = sort(names(stream))
+      )
+    }
+  })
+  
+  
+  simplifyName <- function(x) {
+    x_split = str_split(x, "\\.", simplify = TRUE)
+    n = length(x_split)
+    if (n > 1) {
+      x_col = paste(x_split[1], x_split[n], sep=".")
+    } else {
+      x_col = x_split[1]
+    }
+  }
+  addColumn <- function(tmp_df, x) {
+    x_col = simplifyName(x)
+    tmp_df[[x_col]] = stream[[x]]$value
+    if (length(stream[[x]]$param) > 1) {
+      tmp_df[[sprintf("%s_param",x_col)]] = stream[[x]]$param 
+    }
+    tmp_df
+  }
+  addTrueColumn <- function(tmp_list, x) {
+    tmp_list = c(tmp_list, x)
+    if (length(stream[[x]]$param) > 1) {
+      tmp_list = c(tmp_list, x)
+    }
+    tmp_list
+  }
+  
+  observeEvent(c(input$spreadsheet_view, input$stream, input$apply_change), {
+    tmp_df = list()
+    tmp_list = c()
+    stream_transformation_list = list()
+    if (
+      !is.null(input$stream)) {
+      x = input$stream
+      tmp_df = addColumn(tmp_df, x)
+      tmp_list = addTrueColumn(tmp_list,x)
+      
+      f = stream[[x]]$transformation
+      if (!is.null(f)) {
+        stream_transformation_list[[f]] = x
+      }
+      
+      while (!is.null(stream[[x]]$upstream)) {
+        x = stream[[x]]$upstream
+        tmp_df = addColumn(tmp_df, x)
+        tmp_list = addTrueColumn(tmp_list,x)
+        
+        f = stream[[x]]$transformation
+        if (!is.null(f)) {
+          stream_transformation_list[[f]] = x
+        }
+      }
+    } 
+    tmp_df[["year"]] = year_list
+    tmp_list = c(tmp_list, "year")
+    
+    reactive_spreadsheet$data = data.frame(rev(tmp_df), check.names = FALSE)
+    reactive_spreadsheet$stream_list = rev(tmp_list)
+    reactive_spreadsheet$transformation_list = stream_transformation_list
+    reactive_spreadsheet$decimal_columns = colnames(reactive_spreadsheet$data)[grepl("available", 
+                                                                                     colnames(reactive_spreadsheet$data))]
+    
+    col_disable = c()
+    col_autofill = c()
+    i = 0
+    for (x in names(reactive_spreadsheet$data)) {
+      
+      i = i+1
+      
+      if (is.na(str_match(x, "param"))) {
+        col_disable = c(col_disable, i)
+      } else {
+        col_autofill = c(col_autofill, i)
+      }
+    }
+    
+    reactive_spreadsheet$col_disable = col_disable
+    reactive_spreadsheet$col_autofill = col_autofill
+    
+    # expose delay if part of stream
+    x = input$stream
+    if (!is.null(x) && ("delay" %in% names(reactive_spreadsheet$transformation_list))) {
+      output$param <- renderUI({
+        y = reactive_spreadsheet$transformation_list[["delay"]]
+        list(
+          # must identify stream that uses delay function...
+          
+          numericInput(inputId = "delay", label = "Input Delay", value = stream[[y]]$param),
+          actionButton(inputId = "execute", label = "Execute")
+        )
+      })
+    }
+  })
+  
+  observeEvent(input$delay, {
+    x = input$stream
+    if (!is.null(x) && ("delay" %in% names(reactive_spreadsheet$transformation_list))) {
+      y = reactive_spreadsheet$transformation_list[["delay"]]
+
+      stream[[y]]$param = input$delay
+    }
+  })
+  
+  observeEvent(input$execute, {
+    y = reactive_spreadsheet$transformation_list[["delay"]]
+    stream = updateDownstream(y, stream)
+    updateSpreadsheet()
+  })
+  
+  updateSpreadsheet <- function() {
+    tmp_df = list()
+    tmp_list = c()
+    if (
+      # input$spreadsheet_view == "Transformations" &&
+      !is.null(input$stream)) {
+      x = input$stream
+      tmp_df = addColumn(tmp_df, x)
+      tmp_list = addTrueColumn(tmp_list,x)
+      while (!is.null(stream[[x]]$upstream)) {
+        x = stream[[x]]$upstream
+        tmp_df = addColumn(tmp_df, x)
+        tmp_list = addTrueColumn(tmp_list,x)
+      }
+    } 
+    tmp_df[["year"]] = year_list
+    tmp_list = c(tmp_list, "year")
+    
+    reactive_spreadsheet$data = data.frame(rev(tmp_df), check.names = FALSE)
+    reactive_spreadsheet$stream_list = rev(tmp_list)
+    
+    col_disable = c()
+    col_autofill = c()
+    i = 0
+    for (x in names(reactive_spreadsheet$data)) {
+      
+      i = i+1
+      
+      if (is.na(str_match(x, "param"))) {
+        col_disable = c(col_disable, i)
+      } else {
+        col_autofill = c(col_autofill, i)
+      }
+    }
+    
+    reactive_spreadsheet$col_disable = col_disable
+    reactive_spreadsheet$col_autofill = col_autofill
+  }
+  
+  output$spreadsheet <- renderDataTable({
+    dt = datatable(
+      reactive_spreadsheet$data, 
+      extensions = c("FixedColumns", "AutoFill"),
+      callback = JS(callback),
+      options = list(pageLength = year_n, 
+                     scrollX = TRUE,
+                     scrollY = "50vh",
+                     scrollCollapse = TRUE,
+                     fixedColumns = list(leftColumns = 2),
+                     autoFill = list(columns = reactive_spreadsheet$col_autofill, focus = 'click')),
+      editable = list(target = "column", disable = list(columns = reactive_spreadsheet$col_disable))
+    ) 
+    dt
+  })
+  
+  reactive_spreadsheet <- reactiveValues()
+  
+  updateValue <- function(x) {
+    
+    f = stream[[x]]$transformation
+    upstream = stream[[x]]$upstream
+    
+    if (x %in% c('ICBM.limit', "SSBN.available_D.limit", "SSBN.available_G.limit")){
+      
+      value_list = list()
+      param_list = list()
+      
+      for(i in seq_along(upstream)){
+        y = upstream[[i]]
+        value_list[i] = list(stream[[y]]$value)
+        param_list[i] = list(stream[[stream[[y]]$downstream]]$param)
+        
+      }
+      param = stream[[x]]$param
+      value = do.call(f, list(value_list, param, param_list))
+
+      for(j in seq_along(value)) {
+        
+        z = value[[j]]
+        y = upstream[[j]]
+        
+        stream[[stream[[y]]$downstream]]$value = z
+        
+      }
+      
+    }
+
+    else {
+      
+      x0 = stream[[upstream]]$value
+      param = stream[[x]]$param
+      value = do.call(f, list(x0, param))
+      value
+    }
+  }
+
+  
+  updateDownstream <- function(x, stream) {
+    stream[[x]]$value = updateValue(x)
+    downstream = stream[[x]]$downstream
+    if (!is.null(downstream)) {
+      for (x in downstream) {
+        stream = updateDownstream(x, stream)
+      }
+    }
+    stream
+  }
+  
+  observeEvent(input$spreadsheet_cell_edit, {
+    print("cell edit observed")
+    idx_changed = unique(input$spreadsheet_cell_edit$col)
+    col_changed = names(reactive_spreadsheet$data)[idx_changed]
+    x = reactive_spreadsheet$stream_list[idx_changed]
+    
+    reactive_spreadsheet$data <<- editData(reactive_spreadsheet$data,
+                                           input$spreadsheet_cell_edit,
+                                           proxy = "spreadsheet")
+    
+    stream[[x]]$param = reactive_spreadsheet$data[[col_changed]]
+    stream = updateDownstream(x, stream)
+    # print(stream$Minuteman$value)
+    
+    updateSpreadsheet()
+  })
+  
+  observeEvent(input$spreadsheet_cells_filled, {
+    print("cell filled observed")
+    idx_changed = input$spreadsheet_cells_filled$col[1]
+    col_changed = names(reactive_spreadsheet$data)[idx_changed]
+    x = reactive_spreadsheet$stream_list[idx_changed]
+    reactive_spreadsheet$data <<- editData(reactive_spreadsheet$data,
+                                           input$spreadsheet_cells_filled,
+                                           proxy = "spreadsheet")
+    
+    stream[[x]]$param = reactive_spreadsheet$data[[col_changed]]
+    stream = updateDownstream(x, stream)
+    
+    updateSpreadsheet()
+  })
+  
+  #### Control - Group (Super User) ####
+  group <- reactiveValues()
+  
+  # initialize some groups to start
+  lapply(names(group_json), function(x) {
+    tmp_list = list()
+    tmp_list[["out"]] = unlist(names(stream_json)[!(names(stream_json) %in% group_json[[x]])])
+    tmp_list[["in"]] = unlist(group_json[[x]])
+    group[[x]] = tmp_list
+  })
+  
+  observeEvent(input$add_group, {
+    x = input$group_name
+    if (!is.null(x) & !(x %in% names(group))) {
+      group[[x]] = list()
+      group[[x]][["out"]] = names(stream)
+    }
+    updateTextInput(session = session, inputId = "group_name", value = "")
+  })
+  
+  output$group_list <- renderPrint({
+    for (x in sort(names(group))) {
+      print.noquote(x)
+    }
+  })
+  
+  output$select_group <- renderUI({
+    selectInput(
+      inputId = "select_group",
+      label = "Select Group",
+      choices = sort(names(group))
+    )
+  })
+  
+  output$compose_group <- renderUI({
+    x = input$select_group
+    if (!is.null(x) && (x != "")) {
+      group_out = group[[x]][["out"]]
+      stream_filter = input$stream_filter
+      if (stream_filter == "") {
+        rank_list_labels = group_out
+      } else {
+        pattern = sprintf("%s",input$stream_filter)
+        rank_list_labels = sort(group_out[grepl(pattern, group_out, ignore.case = TRUE)])
+      }
+      bucket_list(
+        header = sprintf("Drag streams to add to %s",x),
+        group_name = "bucket_list_group",
+        orientation = "horizontal",
+        add_rank_list(
+          text = "Drag from here",
+          labels = rank_list_labels,
+          input_id = "rank_list_out"
+        ),
+        add_rank_list(
+          text = sprintf("%s streams",x),
+          labels = group[[x]][["in"]],
+          input_id = "rank_list_in"
+        )
+      )
+    }
+  })
+  
+  observeEvent(input$select_group, {
+    updateTextInput(session = session, inputId = "stream_filter", value = "")
+  })
+  
+  # react to changes in bucket list for selected group
+  observeEvent(c(input$rank_list_in), {
+    x = input$select_group
+    if (!is.null(x) && (x != "")) {
+      rank_list_in = input$rank_list_in
+      group_in = group[[x]][["in"]]
+      group_out = group[[x]][["out"]]
+      
+      dragged_stream = rank_list_in[which(!rank_list_in %in% group_in)]
+
+      if (length(dragged_stream)) {
+        group[[x]][["in"]] = rank_list_in
+        group[[x]][["out"]] = group_out[which(dragged_stream != group_out)]
+      }
+    }
+  })
+  
+  observeEvent(c(input$rank_list_out), {
+    x = input$select_group
+    if (!is.null(x) && (x != "")) {
+      rank_list_out = input$rank_list_out
+      group_in = group[[x]][["in"]]
+      group_out = group[[x]][["out"]]
+      
+      dragged_stream = rank_list_out[which(!rank_list_out %in% group_out)]
+
+      if (length(dragged_stream)) {
+        group[[x]][["out"]] = rank_list_out
+        group[[x]][["in"]] = group_in[which(dragged_stream != group_in)]
+      }
+    }
+  })
+  
+  
+
+  #### Excel export ####
+  output$data_export <- downloadHandler(
+    
+    filename = function(){
+      if(class == "UNCLASSIFIED"){
+        paste0("(U)_GROVES_Data_Export_", 
+               ##### Data documentation PDF ####
+
+               str_replace_all(str_replace_all(Sys.time(),'[-:]',''),' ','_'), 
+               ".zip")
+      } else{
+        paste0("(S_NF_FRD)_GROVES_Data_Export_", 
+               str_replace_all(str_replace_all(Sys.time(),'[-:]',''),' ','_'), 
+               ".zip")
+      }
+    },
+    
+    content = function(file){
+      
+      folder = 'results'
+      tmp_df_value = list()
+      tmp_df_value[["year"]] = year_list
+      
+      tmp_df_delay = list()
+      
+      tmp_df_param = list()
+      tmp_df_param[["year"]] = year_list
+      
+      for (x in sort(names(stream))) {
+        value = stream[[x]]$value
+        param = stream[[x]]$param
+        
+        tmp_df_value[[x]] = value
+        if (!is.null(param)) {
+          if (length(param) > 1) { tmp_df_param[[x]] = param }
+          else { tmp_df_delay[[x]] = param }
+        }
+      }
+      
+      write.csv(x = data.frame(tmp_df_value, check.names = FALSE), file = sprintf("%s/stream_value.csv",folder), row.names = FALSE)
+      write.table(x = t(data.frame(tmp_df_delay, check.names = FALSE)), file = sprintf("%s/stream_delay.csv",folder), sep = ",", col.names = FALSE)
+      write.csv(x = data.frame(tmp_df_param, check.names = FALSE), file = sprintf("%s/stream_param.csv",folder), row.names = FALSE)
+      
+      write(toJSON(stream_json, pretty = TRUE), sprintf("%s/stream.json",folder))
+      
+      group_json = list()
+      for (x in sort(names(group))) {
+        group_json[[x]] = group[[x]][["in"]]
+      }
+      write(toJSON(group_json, pretty = TRUE), sprintf("%s/group.json",folder))
+      
+      zipr(file, folder)
+    },
+    
+    contentType = "application/zip"
+  )
+  
+  
+  VV_dir = "V&V/Test Cases"
+  VV_file_names = list.files(file.path(getwd(), VV_dir))
+  VV_end_path = 'results/change_log.json'
+  report_path = file.path(getwd(), "V&V/Reports/", paste0("reports_", format(Sys.Date()), "_",  format(Sys.time(), "%H"), format(Sys.time(), "%M")), sep = "")
+  dir.create(report_path)
+  results_types <- c("Day to Day", "Generated")
+  ground_truth_path <- file.path(getwd(), "V&V/Ground Truth/")
+  ground_truth.names <- dir(ground_truth_path)
+  
+  log_list <- c()
+  master_df <- data.frame()
+  rollup_df <- data.frame("Test Case"=NA, "D2D or Generated"=NA, "File"=NA, "Match"=NA)
+  
+  observeEvent(input$vv, { 
+  
+  if(input$vv){
+    VV_dir = "V&V/Test Cases"
+    VV_file_names = list.files(file.path(getwd(), VV_dir))
+    VV_end_path = 'results/change_log.json'
+    report_path = file.path(getwd(), "V&V/Reports/")
+    results_types <- c("Day to Day", "Generated")
+    ground_truth_path <- file.path(getwd(), "V&V/Ground Truth/")
+    ground_truth.names <- dir(ground_truth_path)
+    
+    log_list <- c()
+    master_df <- data.frame()
+    rollup_df <- data.frame("Test Case"=NA, "D2D or Generated"=NA, "File"=NA, "Match"=NA)
+        case_num = 1
+    for(vv_file in VV_file_names){
+      showModal(modalDialog(title = "V&V", HTML(paste(paste("Running test case", case_num, "of", length(VV_file_names), sep = " "), paste(vv_file), sep = "<br>")), footer=NULL))
+      case_num = case_num+1
+      print(paste("Verify and Validating", vv_file))
+      
+      initialize_stream()
+      change_log$commit = c()
+      change_log$current = list()
+      initialize_ui_value()
+      initialize_loadout()
+      initialize_saved_loadout_choices()
+    
+      # read import file
+      change_log$current <- read_json(file.path(VV_dir, vv_file, VV_end_path), simplifyVector = TRUE)
+    
+      # apply changes for transformation and loadout
+      for (x_tmp in names(change_log$current)) {
+      
+        x = str_split(string = x_tmp, pattern = "\\.", simplify = TRUE)[1]
+      
+        if (x != "loadout") {
+          for (y in names(change_log$current[[x_tmp]])) {
+          
+            for (z in names(change_log$current[[x_tmp]][[y]])) {
+            
+              ui_value[[x]][[y]][[z]] = change_log$current[[x_tmp]][[y]][[z]]
+              ui_value_saved[[x]][[y]][[z]] = ui_value[[x]][[y]][[z]]
+            }
+          
+            f = ui_private_list[[y]]
+            stream_list = getStreamByTransformation(x, f = f, s = stream)
+          
+            for (s in stream_list) {
+              if (is.null(ui_value[[x]][[y]]$year)) {
+                stream[[s]]$param = ui_value[[x]][[y]]$value
+              } else {
+                stream[[s]]$param[year_list %in% c(ui_value[[x]][[y]]$year[1]:ui_value[[x]][[y]]$year[2])] = ui_value[[x]][[y]]$value
+              }
+              updateDownstream(s, stream)
+            }
+          }
+        } else {
+        
+          for (y in names(change_log$current[[x_tmp]]$loadout)) {
+            loadout_ui_value[[y]] = change_log$current[[x_tmp]]$loadout[[y]]
+          }
+        }
+      }
+    
+      change_log$commit = c(change_log$commit, change_log$current)
+      # print(change_log$commit)
+      output_txt = toJSON(change_log$commit, pretty = TRUE)
+      write(output_txt, paste0('results/', 'change_log.json'))
+    
+      change_log$current = list()
+    
+      change_request_tree()
+      execute_loadout()
+      gather_loadout_plot_data()
+      
+      
+      dir.create(file.path(getwd(), "V&V", "Outputs", vv_file, "Generated"), recursive = TRUE, showWarnings = FALSE)
+      dir.create(file.path(getwd(), "V&V", "Outputs", vv_file, "Day to Day"), recursive = TRUE, showWarnings = FALSE)
+      
+      
+      current_files_gen = list.files(file.path(getwd(), "results", "Generated"))
+      current_files_day = list.files(file.path(getwd(), "results", "Day to Day"))
+      
+      current_files_gen <- current_files_gen[grep("received.+", current_files_gen)]
+      current_files_day <- current_files_day[grep("received.+", current_files_day)]
+      
+      file.copy(file.path(getwd(), "results/Generated", current_files_gen), file.path(getwd(), "V&V", "Outputs", vv_file, "Generated"), overwrite = TRUE)
+      file.copy(file.path(getwd(), "results/Day to Day", current_files_gen), file.path(getwd(), "V&V", "Outputs", vv_file, "Day to Day"), overwrite = TRUE)
+      
+      test_case_path <- file.path(getwd(), "V&V/Outputs/")
+      ground_truth_case_path <- file.path(ground_truth_path, vv_file)
+      
+      for (j in 1:length(results_types)){
+        tc_path <- file.path(test_case_path, vv_file, results_types[j])
+        gt_path <- file.path(ground_truth_path, vv_file, "results", results_types[j])
+        file.names <- dir(gt_path, pattern ="received")
+        log_list <- c(log_list, paste(vv_file, ": ", results_types[j], " Outputs", sep = ""))
+        
+        for(i in 1:length(file.names)){
+          filename_gt <- file.path(gt_path, file.names[i])
+          
+          gt_df <- read.csv(filename_gt,header=TRUE, sep=",", stringsAsFactors=FALSE)
+          
+          filename_tc = file.path(tc_path, file.names[i])
+          
+          tc_df <- read.csv(filename_tc,header=TRUE, sep=",", stringsAsFactors=FALSE)
+          
+          
+          newdata <- anti_join(gt_df,tc_df)
+          newdata2 <- anti_join(tc_df, gt_df)
+          if (dim(newdata)[1] == 0 && dim(newdata2)[1] == 0) {
+            log_list <- c(log_list, paste("\t", file.names[i], ": MATCH"))
+            
+            temp <- data.frame("Test Case"=vv_file, "D2D or Generated"=results_types[j], "File"=file.names[i], "Match"="YES")
+            rollup_df <- rbind(rollup_df, temp)
+            
+          } else {
+            print(filename_gt)
+            
+            
+            if (dim(newdata)[1] > dim(newdata2)[1]) {
+              
+              add_dim <- dim(newdata)[1] - dim(newdata2)[1]
+              newdata2[dim(newdata2)[1]+add_dim,] <- NA
+              
+            } else if (dim(newdata2)[1] > dim(newdata)[1]) {
+              
+              add_dim <- dim(newdata2)[1] - dim(newdata)[1]
+              newdata[dim(newdata)[1]+add_dim,] <- NA
+              
+            } 
+            com_df <- cbind(newdata, newdata2)
+            names(com_df) <- c ("GT_year", "GT_q", "GT_child", "GT_request_route", "GT_route_length", "TC_year", "TC_q", "TC_child", "TC_request_route", "TC_route_length")
+            
+            
+            com_df["file"] = file.names[i]
+            com_df["type"] = results_types[j]
+            com_df["test_case"] = vv_file
+            
+            log_list <- c(log_list, paste("\t", file.names[i], ": NO MATCH - See output CSV for details"))
+            temp <- data.frame("Test Case"=vv_file, "D2D or Generated"=results_types[j], "File"=file.names[i], "Match"="NO")
+            rollup_df <- rbind(rollup_df, temp)
+            
+            outpath <- file.path(report_path, vv_file)
+            if (file.exists(outpath)){
+              
+            } else {
+              dir.create(outpath, recursive = TRUE)
+              
+              
+            }
+            
+            outpath2 <- file.path(outpath, results_types[j])
+            if (file.exists(outpath2)){
+              
+            } else {
+              dir.create(outpath2, recursive = TRUE)
+              
+            }
+            master_df <- rbind(master_df, com_df)
+            write.table(com_df, file.path(outpath2, file.names[i]), sep = ",", row.names = FALSE)
+          }
+          
+        }
+      }
+                                  
+    }
+    log_list <- c(log_list, "\n---------------------END OF CASE-----------------------------\n")
+    outdf <- write.table(master_df, file.path(report_path, "master_output.csv"), sep=',', row.names = FALSE)
+    rollup_df <-na.omit(rollup_df)
+    rollup <- write.table(rollup_df, file.path(report_path, "test_rollup.csv"), sep=',', row.names = FALSE)
+    
+    
+    outfile <- file(file.path(report_path, "test_rollup.txt"))
+    writeLines(log_list, outfile)
+    close(outfile)
+    rollup_df_summary <- rollup_df %>% group_by(Test.Case) %>% mutate("Failed" = ifelse(any(Match == "NO"), TRUE, FALSE)) %>% distinct(Test.Case, Failed)
+    print(rollup_df_summary)
+    showModal(modalDialog(title = "V&V Finished. Results", HTML(paste(paste("# of Test Cases Passed: ", sum(rollup_df_summary$Failed == FALSE)), paste("# of Test Cases Failed: ", sum(rollup_df_summary$Failed == TRUE)), sep = "<br>"))))
+  } 
+    
+ })
+  
+  
+  
+  
+  
+  
+  #### Random UI ####
+  # header and footer
+  output$header <- renderText({paste0("This page displays dynamic content classified up to ", class, ".")})
+  output$footer <- renderText({paste0("This page displays dynamic content classified up to ", class, ".")})
+  
+  version_data <- read.csv(file = 'data/commit_info.csv', header = FALSE)
+  
+  output$version <- renderText({paste0("Version: ", version_data[1,2], sep=" ")})
+  output$date <- renderText({paste0("Commit Date: ", version_data[2,2], sep=" ")})
+
+  
+  # Not to be treated the same as exporting data
+  # Literally meant to save the "state" of the application that is to be used by others
+  #### Save - State ####
+  observeEvent(input$save_state, {
+    tmp_df = list()
+    tmp_df[["year"]] = year_list
+    
+    tmp_df_delay = list()
+    
+    tmp_df_baseline = list()
+    tmp_df_baseline[["year"]] = year_list
+    
+    stream_json = list()
+    
+    for (x in sort(names(stream))) {
+      value = stream[[x]]$value
+      param = stream[[x]]$param
+      
+      if (is.null(param)) {
+        tmp_df_baseline[[x]] = value
+      } else {
+        if (length(param) > 1) { tmp_df[[x]] = param }
+        else { tmp_df_delay[[x]] = param }
+      }
+      
+      upstream = stream[[x]]$upstream
+      downstream = stream[[x]]$downstream
+      f = stream[[x]]$transformation
+      stream_json[[x]] = list()
+      if (!is.null(upstream)) { stream_json[[x]]$upstream = upstream }
+      if (!is.null(downstream)) { stream_json[[x]]$downstream = downstream }
+      if (!is.null(f)) { stream_json[[x]]$transformation = f }
+    }
+    
+    write.csv(x = data.frame(tmp_df, check.names = FALSE), file = "./stream_param.csv", row.names = FALSE)
+    write.table(x = t(data.frame(tmp_df_delay, check.names = FALSE)), file = "./stream_delay.csv", sep = ",", col.names = FALSE)
+    write.csv(x = data.frame(tmp_df_baseline, check.names = FALSE), file = "./stream_baseline.csv", row.names = FALSE)
+    
+    write(toJSON(stream_json, pretty = TRUE), 'stream.json')
+    
+    group_json = list()
+    for (x in sort(names(group))) {
+      group_json[[x]] = group[[x]][["in"]]
+    }
+    write(toJSON(group_json, pretty = TRUE), 'group.json')
+    # toJSON(group, ...) and toJSON(stream, ...) do not work because they are reactiveValues()
+  })
+}

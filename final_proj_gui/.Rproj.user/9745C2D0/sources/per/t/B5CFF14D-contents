@@ -1,0 +1,253 @@
+library(shinydashboard)
+library(sortable)
+library(DT)
+library(shinyjs)
+library(plotly)
+library(shinyBS)
+
+source("params.R")
+source("loadout_params.R")
+source("loadout_logic.R")
+
+summary_list = list(h4("Summary of User Changes"),
+                    wellPanel(
+                      htmlOutput("changelog"),
+                      tags$head(tags$style("#changelog{overflow-y:scroll; max-height: 20vh}")),
+                      br(),
+                      br(),
+                      actionButton("restore_defaults",
+                                   "Restore Baseline")
+                    ),
+                    # Input: Select a file ----
+                    fileInput("history", "Import History",
+                              multiple = FALSE,
+                              placeholder = "JSON File",
+                              accept = c("application/json",
+                                         ".json")),
+                    downloadButton("data_export", "Export Data"),
+                    br(),
+                    br(),
+                    textOutput("contact")
+) # close list
+
+fluidPage(
+  shinyjs::useShinyjs(),
+  
+  tags$style(".fullwidth { width: 100% }"),
+
+  tags$head(tags$script('
+                        var width = 0;
+                        $(document).on("shiny:connected", function(e) {
+                          width = window.scrollWidth;
+                          Shiny.onInputChange("width", width);
+                        });
+                        $(window).resize(function(e) {
+                          width = window.scrollWidth;
+                          Shiny.onInputChange("width", width);
+                        });
+                        ')),
+  
+  # tags$head(
+  #   tags$script(
+  #     HTML("
+  #           $(document).ready(function(){
+  #             // Mark columns we want to toggle
+  #             $('body').find('div [class=col-sm-4]').addClass('sidebarPanel');
+  #             $('body').find('div [class=col-sm-8]').addClass('mainPanel');
+  #           })
+  # 
+  # 
+  #           Shiny.addCustomMessageHandler ('resize',function (message) {
+  #             $('.sidebarPanel').toggle();
+  #             $('.mainPanel').toggleClass('col-sm-8 col-sm-12');
+  #             $(window).trigger('resize')
+  #           });
+  # 
+  #          ")
+  #   )
+  # ),
+  
+  #classification header
+  fluidRow(column(12, textOutput("header"), align="center")),
+  
+  #custom css for header
+  tags$head(tags$style("#header{color: red;}")),
+  
+  # title displayed at top of page
+  column(width = 11, tags$head(
+    # Note the wrapping of the string in HTML()
+    tags$style(HTML("
+      @import url('https://fonts.googleapis.com/css2?family=Yusei+Magic&display=swap');
+      body {
+
+      }
+      h2 {
+        font-family: 'Yusei Magic', sans-serif;
+      }
+      .shiny-input-container {
+        color: black;
+      }"))
+  ),
+         titlePanel("Groves: Version 2.0"), align="center"
+      
+  ),
+  
+  # add IDA logo for application
+  column(width = 1, tags$h2(tags$img(height = 50, src = "IDAnewlogo.png", align="right")))
+  ,
+  
+  actionButton("showpanel", "Toggle sidebar"),
+  
+  # sidebarLayout(
+  #   sidebarPanel(
+     
+   div( id = "Sidebar", 
+        column(panel_width_dial,
+           tabsetPanel(
+             type = "tabs",
+             id = "dials",
+             tabPanel(
+               title = "Inventory Controls",
+               value = "stream",
+               wellPanel(
+                 uiOutput(outputId = "select_src"),
+                 uiOutput(outputId = "select_transformation"),
+                 uiOutput(outputId = "transformation_details_user")
+               )
+             ),
+             tabPanel(
+               title = "Loadout Controls",
+               value = "loadout",
+               wellPanel(
+                 selectInput(inputId = "loadout_0", label = "Select Leg", choices = names(logic)),
+                 lapply(c(0:3), function(i) {
+                   uiOutput(sprintf("loadout_details_%i",i))
+                 })
+               )
+             ),
+             tabPanel(
+               title = "Requirements",
+               value = "requirement",
+               wellPanel(
+                 uiOutput(outputId = "requirement_title"),
+                 uiOutput(outputId = "requirement")
+               )
+             )
+           ),
+           actionButton("apply_change","Apply Change")
+           ,
+           summary_list,
+           # fluidrow_summary_test
+            #checkboxInput(inputId = "super", label = "Super User"),
+           
+           actionButton("vv","V&V")
+    
+   )
+   ),
+    div( id = "Main", 
+         column(uiOutput("cols"),
+           # visualization panel ----
+           
+           fluidRow(
+             
+             conditionalPanel(
+               "input.viz != 'stream' && input.viz != 'spreadsheet' && input.viz != 'group'",
+               column(4, radioButtons("select_orientation", "Select Orientation", 
+                                      choices=c("Side-by-Side","Baseline Only","Change Only"),
+                                      selected="Side-by-Side",
+                                      inline=TRUE)) 
+             ),
+             conditionalPanel(
+               "input.viz=='Availability' || input.viz=='Available Inv' || input.viz=='Limit-Constrained Inv' || input.viz=='Loadout-Constrained Inv'",
+               column(4, radioButtons("sense", 
+                                      "Availability Posture", 
+                                      c("Generated", "Day to Day"), 
+                                      "Generated", 
+                                      inline = T))
+             ),
+             conditionalPanel(
+               "input.viz=='Force Structure Inv' || input.viz=='Limits' || input.viz=='Limit-Constrained Inv' || input.viz=='Availability' || input.viz=='Available Inv'",
+               column(
+                 # 8,
+                 12,
+                 checkboxGroupInput(
+                   "group_view", 
+                   "View", 
+                   c("ICBM", "SSBN", "Bomber", 
+                     "SLBM", "Cruise Missile",
+                     "ICBM Warhead", "SLBM Warhead", "Cruise Missile Warhead", "Gravity Bomb"),
+                   selected = c("ICBM", "SSBN", "Bomber"),
+                   inline = T)
+               )
+             ),
+             conditionalPanel(
+               "input.viz=='Loadout-Constrained Inv'",
+               column(4,
+                      radioButtons("sos_leg",
+                                   "View",
+                                   leg_list,
+                                   "Triad",
+                                   inline = T)
+               ),
+               column(
+                 8,
+                 radioButtons("sos_detail",
+                              "Level of Detail",
+                              c("Summary", "Weapon-Level", "Warhead-Level", "Substitution-Level"),
+                              "Summary",
+                              inline = T)
+               ),
+               column(4, uiOutput(outputId = "req_view"))
+             )
+           ), # close fluidRow
+           
+           tabsetPanel(type = "tabs",
+                       
+                       id = "viz",
+                       
+                       tabPanel("Force Structure Inv", value = 'Force Structure Inv', column(12, uiOutput("force"))),
+                       tabPanel("Availability", value = 'Availability', column(12, uiOutput("available_param"))),
+                       tabPanel("Available Inv", value = 'Available Inv', column(12, uiOutput("available"))),
+                       tabPanel("Limits", value = 'Limits', column(12, uiOutput("limit_param"))),
+                       tabPanel("Limit-Constrained Inv", value = 'Limit-Constrained Inv', column(12, uiOutput("limit"))),
+                       tabPanel(
+                         title = "Loadout Param",
+                         value = "loadout_param",
+                         column(
+                           12,
+                           plotlyOutput("loadout_param_q.x", height = "auto"),
+                           plotlyOutput("loadout_param_q.y", height = "auto"),
+                           uiOutput("loadout_param")
+                         )
+                       ),
+                       tabPanel(title = "Fielded", value = 'Loadout-Constrained Inv', 
+                                column(
+                                  12, 
+                                  lapply(rev(levels(type_list)), function(type) {
+                                    uiOutput(sprintf("loadout_%s",type))
+                                  })
+                                )
+                       )
+       
+           ) # close tabSetPanel
+           
+    ) # close column
+    
+    
+  ), # close fluidRow
+  
+  #classification footer
+  fluidRow(
+    column(width=12, textOutput("version"), textOutput("date"), align="right")),
+  
+  fluidRow(
+    column(width=12, textOutput("footer"), align="center")), 
+
+  
+  # 
+  # # add IDA logo for application
+  # column(width = 1, tags$h2(tags$img(height = 50, src = "IDAnewlogo.png", align="right")))
+  
+  #custom css for header
+  tags$head(tags$style("#footer{color: red;}"))
+)
